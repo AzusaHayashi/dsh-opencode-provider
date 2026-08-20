@@ -1,0 +1,5 @@
+# Mount the OpenCode-backed LLM provider into a DeepSeek Harness profile.
+
+- insert:
+    - id: llm-opencode
+      name: 'dsh-opencode-provider'
