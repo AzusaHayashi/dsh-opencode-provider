@@ -1,34 +1,33 @@
 /**
  * Register an {@link OpenCodeAdapter} for the `opencode-local` provider route on
- * `ctx.llm`. The adapter talks to a local OpenCode server at 127.0.0.1:4096
- * (configurable via cordis.yml) and requires no API key.
+ * `ctx.llm`. The adapter spawns the local `opencode` CLI (`opencode run
+ * --format json`) instead of calling the OpenCode HTTP server, because the
+ * supported free models are only executable by a first-party client.
  *
  * @module dsh-opencode-provider
  */
 import type { Context } from '@deepseek-ai/cordis';
 import type { RetryPolicyConfig } from '@deepseek-ai/dsh-llm';
-export { DEFAULT_BASE_URL, DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS, OPENCODE_PROVIDER_ID, OpenCodeAdapter, } from './adapter.ts';
-export type { OpenCodeAdapterOptions, OpenCodeConnectionOptions } from './adapter.ts';
+import type { OpenCodeModelEntry } from './adapter.ts';
+export { DEFAULT_CLI_PATH, DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS, DEFAULT_MODELS, DEFAULT_TIMEOUT_MS, OPENCODE_PROVIDER_ID, OpenCodeAdapter, } from './adapter.ts';
+export type { OpenCodeAdapterOptions, OpenCodeConnectionOptions, OpenCodeModelEntry, } from './adapter.ts';
 export declare const name = "llm-opencode";
 export declare const inject: string[];
 /**
- * Plugin config. Every field is optional in yml: the base URL defaults to
- * the local OpenCode server and no API key is required.
+ * Plugin config. Every field is optional in yml. The CLI path defaults to
+ * `opencode` on `PATH` and can be overridden with `OPENCODE_CLI_PATH`.
  */
 export interface Config {
-    /** Endpoint base; defaults to http://127.0.0.1:4096. */
-    baseURL?: string;
+    /** Path to the `opencode` executable; defaults to `OPENCODE_CLI_PATH` or `opencode`. */
+    cliPath?: string;
     /** Positive context capacity used when the selected model has no exact value. */
     defaultContextWindow?: number;
     /** Default per-request output cap; explicit request values win. */
     maxTokens?: number;
-    /** Advisory models shown by discovery consumers; defaults to mimo-v2.5-free. */
-    models?: Array<{
-        id: string;
-        name?: string;
-        description?: string;
-        contextWindow?: number;
-    }>;
+    /** Wall-clock cap for one CLI turn; defaults to 600000 ms. */
+    timeoutMs?: number;
+    /** Models shown to DSH model pickers; defaults to a small free-model catalogue. */
+    models?: OpenCodeModelEntry[];
     /** Provider-owned model-request retry policy; omission uses normal mode. */
     retryPolicy?: RetryPolicyConfig;
 }

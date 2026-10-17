@@ -1,20 +1,27 @@
 /**
- * `OpenCodeAdapter`: HTTP + SSE against a local OpenCode server, emitting
- * harness StreamChunks. The adapter creates a session, subscribes to events,
- * sends the serialized conversation as a prompt, and translates SSE events
- * into the harness streaming protocol.
+ * `OpenCodeAdapter`: drives the local `opencode` CLI in JSON-event mode and
+ * emits harness StreamChunks.
  *
- * This adapter is text-output only because OpenCode runs its own internal
- * agent/tool loop. Structured DSH tool calling is not advertised.
+ * Why the CLI instead of the HTTP server: OpenCode v1.19.x exposes two model
+ * runtimes. "native" models (the free `opencode/*-free` catalogue) are only
+ * executable by the first-party client, and the headless `opencode serve`
+ * runner rejects them with `SessionRunnerModel.UnsupportedApiError`, while the
+ * OpenCode backend rejects them with `FreeTierError` when the request does not
+ * come from a first-party client. `opencode run` is a first-party client, so
+ * spawning it is the only supported path that keeps the free catalogue usable
+ * from inside another harness.
+ *
+ * The adapter serializes the whole DSH conversation into one prompt, pipes it
+ * to the CLI over stdin (no command-line length limits), and translates the
+ * CLI's `--format json` event lines into harness StreamChunks.
+ *
+ * This adapter is text-output only: OpenCode runs its own internal agent/tool
+ * loop, so structured DSH tool calling is not advertised.
  *
  * @module dsh-llm-opencode/adapter
  */
 
-import {
-  attributionHeaders,
-  LlmAdapter,
-  LlmError,
-} from '@deepseek-ai/dsh-llm'
+import { LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm'
 import type {
   GenerateOptions,
   LlmModelInfo,
@@ -23,151 +30,54 @@ import type {
   ResolvedRetryPolicy,
   StreamChunk,
 } from '@deepseek-ai/dsh-llm'
-import { randomBytes } from 'node:crypto'
+import { spawn } from 'node:child_process'
+import type { ChildProcess } from 'node:child_process'
 import { serializeConversation } from './serialize.ts'
-import type {
-  WireEvent,
-  WireTextDeltaEvent,
-  WireTextEndedEvent,
-  WireStepEndedEvent,
-} from './types.ts'
 
-/** Default base URL for the local OpenCode server. */
-export const DEFAULT_BASE_URL = 'http://127.0.0.1:4096'
-
-/** Default context window for the OpenCode provider. */
+/** Default context window when a model entry does not declare one. */
 export const DEFAULT_CONTEXT_WINDOW = 128_000
 
 /** Default per-request output-token cap. */
 export const DEFAULT_MAX_TOKENS = 16_384
 
-/** Timeout (ms) for the SSE stream to return HTTP response headers. */
-const SSE_ESTABLISH_TIMEOUT_MS = 10_000
-
-/** Timeout (ms) for the prompt POST to return 200. */
-const PROMPT_ADMISSION_TIMEOUT_MS = 10_000
-
-/** Timeout (ms) for a terminal SSE event to arrive after prompt delivery. */
-const TERMINAL_COMPLETION_TIMEOUT_MS = 120_000
-
 /**
- * The providerID used in the OpenCode `ModelRef` when selecting a model.
- * This maps the DSH `opencode-local` provider route to the wire-level
- * `opencode` providerID that the OpenCode server expects.
+ * Wire provider ID inside OpenCode. The DSH route is `opencode-local`, but the
+ * model string handed to `opencode run` is `opencode/<model>`.
  */
 export const OPENCODE_PROVIDER_ID = 'opencode'
 
-/** Error codes for terminal OpenCode session events. */
-const ERROR_CODE_MAP: Record<string, string> = {
-  'session.execution.failed': 'PROVIDER_ERROR',
-  'session.error': 'PROVIDER_ERROR',
-  'session.next.step.failed': 'PROVIDER_ERROR',
-}
+/** Default CLI executable looked up on `PATH`. */
+export const DEFAULT_CLI_PATH = 'opencode'
 
-/** Generate a unique message ID for prompt requests. */
-function generateMessageId(): string {
-  return `msg_${Date.now()}_${randomBytes(8).toString('hex')}`
-}
+/** Default wall-clock cap for one CLI turn. */
+export const DEFAULT_TIMEOUT_MS = 600_000
 
-/** Read the response body as text, returning empty string on failure. */
-async function errorBody(response: Response): Promise<string> {
-  try {
-    return await response.text()
-  } catch {
-    return ''
-  }
+/** Catalogue entry surfaced to DSH model pickers. */
+export interface OpenCodeModelEntry {
+  id: string
+  name?: string
+  description?: string
+  contextWindow?: number
+  maxTokens?: number
 }
 
 /**
- * Race a promise against a timeout. Resolves with the promise result or
- * rejects with an `LlmError` tagged with the stage and session ID.
+ * Free models that the CLI can drive today. Availability changes upstream; run
+ * `opencode models` to inspect the live catalogue.
  */
-function withTimeout<T>(
-  promise: Promise<T>,
-  ms: number,
-  stage: string,
-  sessionId: string,
-  signal?: AbortSignal,
-): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      reject(new LlmError(
-        `OpenCode ${stage} timed out after ${ms}ms (session ${sessionId})`,
-        'TIMEOUT',
-      ))
-    }, ms)
+export const DEFAULT_MODELS: readonly OpenCodeModelEntry[] = [
+  { id: 'mimo-v2.6-flash-free', name: 'MiMo V2.6 Flash (free)' },
+  { id: 'glm-5.3-flash-free', name: 'GLM-5.3 Flash (free)' },
+  { id: 'deepseek-v4.1-flash-free', name: 'DeepSeek V4.1 Flash (free)' },
+  { id: 'nemotron-3.5-lightning-free', name: 'Nemotron 3.5 Lightning (free)' },
+  { id: 'qwen3.6-plus-free', name: 'Qwen3.6 Plus (free)' },
+]
 
-    // Forward caller abort into the timer race.
-    const onAbort = (): void => {
-      clearTimeout(timer)
-      reject(new LlmError(
-        `OpenCode ${stage} aborted (session ${sessionId})`,
-        'ABORTED',
-      ))
-    }
-    signal?.addEventListener('abort', onAbort, { once: true })
-
-    promise.then(
-      (value) => { clearTimeout(timer); signal?.removeEventListener('abort', onAbort); resolve(value) },
-      (err) => { clearTimeout(timer); signal?.removeEventListener('abort', onAbort); reject(err) },
-    )
-  })
-}
-
-/**
- * Best-effort POST to the interrupt endpoint so the server stops processing.
- * Fire-and-forget; errors are swallowed.
- */
-async function interruptSession(
-  baseURL: string,
-  sessionId: string,
-  signal?: AbortSignal,
-): Promise<void> {
-  try {
-    await fetch(`${baseURL}/api/session/${sessionId}/interrupt`, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'accept': 'application/json',
-        ...attributionHeaders(),
-      },
-      body: '{}',
-      signal: signal ?? null,
-    })
-  } catch {
-    // Interrupt is best-effort; the caller owns the terminal error.
-  }
-}
-
-/** Validate an SSE line and extract the data payload. */
-function parseSseLine(line: string): string | null {
-  if (line.startsWith('data: ')) return line.slice(6)
-  return null
-}
-
-/** Parse an SSE event string into typed event data. */
-function parseSseEvent(raw: string): WireEvent {
-  try {
-    return JSON.parse(raw) as WireEvent
-  } catch {
-    return { type: undefined, data: undefined }
-  }
-}
-
-/**
- * Validate an OpenCode response envelope. The server may wrap responses in
- * `{ data: { ... } }` or return them directly.
- */
-function unwrapEnvelope(body: unknown): unknown {
-  if (body !== null && typeof body === 'object' && 'data' in body) {
-    return (body as Record<string, unknown>).data
-  }
-  return body
-}
-
-/** Connection options resolved once per stream call. */
+/** Connection facts resolved once per stream call. */
 export interface OpenCodeConnectionOptions {
-  baseURL: string
+  cliPath: string
+  timeoutMs: number
+  models: readonly OpenCodeModelEntry[]
   retryPolicy: ResolvedRetryPolicy
 }
 
@@ -175,33 +85,49 @@ export interface OpenCodeConnectionOptions {
 export interface OpenCodeAdapterOptions {
   /** Current validated connection facts; called once per operation. */
   options: () => OpenCodeConnectionOptions
+  /**
+   * Test seam: replace the CLI process factory. Production omits it and the
+   * adapter spawns the real executable.
+   */
+  spawn?: (command: string, args: readonly string[]) => ChildProcess
 }
 
-function modelInfo(provider: string): LlmModelInfo {
+/** Normalize one configured model entry into the DSH model description. */
+function modelInfo(provider: string, entry: OpenCodeModelEntry): LlmModelInfo {
   return {
     provider,
-    id: 'mimo-v2.5-free',
-    name: 'mimo-v2.5-free',
-    description: 'OpenCode local agent (text output only)',
+    id: entry.id,
+    name: entry.name ?? entry.id,
+    description: entry.description ?? 'OpenCode local agent (text output only)',
     inputModalities: ['text'],
   }
+}
+
+/** One parsed CLI stdout event line, narrowed to the fields we consume. */
+interface CliEvent {
+  type?: string
+  part?: { text?: unknown }
+  error?: { name?: unknown; data?: { message?: unknown } }
 }
 
 /**
  * The OpenCode LLM adapter. One instance serves every model name it was
  * registered under (the harness model name IS the wire model name).
- *
- * The adapter creates a fresh OpenCode session per stream call, serializes
- * the full DSH conversation into the prompt, and translates SSE events into
- * harness StreamChunks.
  */
 export class OpenCodeAdapter extends LlmAdapter {
+  private readonly spawnCli: (command: string, args: readonly string[]) => ChildProcess
+
   constructor(private readonly config: OpenCodeAdapterOptions) {
     super()
+    this.spawnCli = config.spawn ?? ((command, args) => spawn(command, [...args], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: process.env,
+      windowsHide: true,
+    }))
   }
 
   override providerInfo(provider: string): LlmProviderInfo {
-    return { id: provider, name: 'OpenCode' }
+    return { id: provider, name: 'OpenCode (local CLI)' }
   }
 
   override providerRetryPolicy(_provider: string): ResolvedRetryPolicy {
@@ -209,7 +135,8 @@ export class OpenCodeAdapter extends LlmAdapter {
   }
 
   override listModels(provider: string): Promise<readonly LlmModelInfo[]> {
-    return Promise.resolve([modelInfo(provider)])
+    const { models } = this.config.options()
+    return Promise.resolve(models.map((entry) => modelInfo(provider, entry)))
   }
 
   override resolveModel(
@@ -217,333 +144,204 @@ export class OpenCodeAdapter extends LlmAdapter {
     model: string,
     _signal?: AbortSignal,
   ): Promise<LlmResolvedModelInfo> {
+    const { models } = this.config.options()
+    const entry = models.find((candidate) => candidate.id === model)
     return Promise.resolve({
       provider,
       id: model,
-      name: model,
-      description: 'OpenCode local agent (text output only)',
+      name: entry?.name ?? model,
+      description: entry?.description ?? 'OpenCode local agent (text output only)',
       inputModalities: ['text'],
-      context: { contextWindow: DEFAULT_CONTEXT_WINDOW },
-      defaultMaxTokens: DEFAULT_MAX_TOKENS,
+      context: { contextWindow: entry?.contextWindow ?? DEFAULT_CONTEXT_WINDOW },
+      defaultMaxTokens: entry?.maxTokens ?? DEFAULT_MAX_TOKENS,
     })
   }
 
-  async * stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+  async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     const connection = this.config.options()
-
-    // Create a new OpenCode session.
-    let sessionId: string | undefined
-    try {
-      const createResponse = await fetch(`${connection.baseURL}/api/session`, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          'accept': 'application/json',
-          ...attributionHeaders(),
-        },
-        body: JSON.stringify({ model: { id: options.model, providerID: OPENCODE_PROVIDER_ID } }),
-        signal: options.signal ?? null,
-      })
-      if (!createResponse.ok) {
-        const body = await errorBody(createResponse)
-        throw new LlmError(
-          `OpenCode session creation failed (HTTP ${createResponse.status}): ${body}`,
-          'TRANSPORT',
-          { status: createResponse.status },
-        )
-      }
-      const createBody: unknown = await createResponse.json()
-      const unwrapped = unwrapEnvelope(createBody) as Record<string, unknown> | null | undefined
-      const bodyRecord = createBody as Record<string, unknown>
-      const dataField = bodyRecord.data as Record<string, unknown> | undefined
-      const candidate = (unwrapped?.id as string | undefined)
-        ?? (dataField?.id as string | undefined)
-        ?? (bodyRecord.id as string | undefined)
-        ?? (unwrapped?.sessionID as string | undefined)
-        ?? (dataField?.sessionID as string | undefined)
-        ?? (bodyRecord.sessionID as string | undefined)
-      if (typeof candidate !== 'string' || candidate.length === 0) {
-        throw new LlmError('OpenCode session creation returned no session ID', 'EMPTY_RESPONSE')
-      }
-      sessionId = candidate
-    } catch (error: unknown) {
-      if (options.signal?.aborted) {
-        throw new LlmError('OpenCode request aborted by caller', 'ABORTED', { cause: error })
-      }
-      if (error instanceof LlmError) throw error
-      throw new LlmError(
-        `OpenCode session creation to ${connection.baseURL} failed`,
-        'TRANSPORT',
-        { cause: error },
-      )
-    }
-
-    // Start the SSE stream and send the prompt concurrently to avoid a
-    // deadlock: the server may withhold SSE response headers until the
-    // session has activity, which only happens after prompt delivery.
-    const eventController = new AbortController()
-    const mergedSignal = options.signal === undefined
-      ? eventController.signal
-      : AbortSignal.any([options.signal, eventController.signal])
-
-    // Fire the SSE fetch WITHOUT awaiting — the promise runs concurrently
-    // with prompt delivery. The server will send response headers once the
-    // prompt creates session activity.
-    const sseFetchPromise = fetch(
-      `${connection.baseURL}/api/session/${sessionId}/event`,
-      {
-        method: 'GET',
-        headers: {
-          'accept': 'text/event-stream',
-          ...attributionHeaders(),
-        },
-        signal: mergedSignal,
-      },
-    )
-
-    // Serialize the full DSH conversation into the prompt.
     const prompt = serializeConversation(options)
+    const modelArg = `${OPENCODE_PROVIDER_ID}/${options.model}`
 
-    // Send the prompt FIRST (concurrently with SSE establishment).
-    let eventReader: ReadableStreamDefaultReader<Uint8Array> | undefined
+    // Spawn the first-party CLI. `--format json` emits one JSON object per
+    // line on stdout; stderr is diagnostic only.
+    let child: ChildProcess
     try {
-      const promptResponse: Response = await withTimeout(
-        fetch(
-          `${connection.baseURL}/api/session/${sessionId}/prompt`,
-          {
-            method: 'POST',
-            headers: {
-              'content-type': 'application/json',
-              'accept': 'application/json',
-              ...attributionHeaders(),
-            },
-            body: JSON.stringify({
-              id: generateMessageId(),
-              prompt: { text: prompt, files: [] },
-              delivery: 'steer',
-            }),
-            signal: mergedSignal,
-          },
-        ),
-        PROMPT_ADMISSION_TIMEOUT_MS,
-        'prompt admission',
-        sessionId,
-        options.signal,
-      )
-      if (!promptResponse.ok) {
-        const body = await errorBody(promptResponse)
-        throw new LlmError(
-          `OpenCode prompt delivery failed (HTTP ${promptResponse.status}): ${body}`,
-          'TRANSPORT',
-          { status: promptResponse.status },
-        )
-      }
-    } catch (error: unknown) {
-      eventController.abort()
-      void interruptSession(connection.baseURL, sessionId)
-      if (error instanceof LlmError) throw error
-      if (options.signal?.aborted) {
-        throw new LlmError('OpenCode request aborted by caller', 'ABORTED', { cause: error })
-      }
+      child = this.spawnCli(connection.cliPath, ['run', '--format', 'json', '-m', modelArg])
+    } catch (error) {
       throw new LlmError(
-        `OpenCode prompt delivery to ${connection.baseURL} failed`,
+        `OpenCode CLI launch failed (${connection.cliPath}): ${String(error)}`,
         'TRANSPORT',
         { cause: error },
       )
     }
 
-    // Now await the SSE stream — the prompt has created session activity
-    // so the server will flush response headers.
-    try {
-      const eventResponse: Response = await withTimeout(
-        sseFetchPromise,
-        SSE_ESTABLISH_TIMEOUT_MS,
-        'SSE stream establishment',
-        sessionId,
-        options.signal,
-      )
-      if (!eventResponse.ok) {
-        const body = await errorBody(eventResponse)
-        throw new LlmError(
-          `OpenCode event subscription failed (HTTP ${eventResponse.status}): ${body}`,
-          'TRANSPORT',
-          { status: eventResponse.status },
-        )
-      }
-      if (!eventResponse.body) {
-        throw new LlmError('OpenCode event stream returned no body', 'EMPTY_RESPONSE')
-      }
-      eventReader = eventResponse.body.getReader()
-    } catch (error: unknown) {
-      eventController.abort()
-      void interruptSession(connection.baseURL, sessionId)
-      if (error instanceof LlmError) throw error
-      if (options.signal?.aborted) {
-        throw new LlmError('OpenCode request aborted by caller', 'ABORTED', { cause: error })
-      }
-      throw new LlmError(
-        `OpenCode event subscription to ${connection.baseURL} failed`,
-        'TRANSPORT',
-        { cause: error },
-      )
-    }
+    const stdin = child.stdin
+    const stdout = child.stdout
+    const stderr = child.stderr
 
-    // Read SSE events and translate to StreamChunks.
-    let blockOpened = false
-    let accumulatedText = ''
-    const decoder = new TextDecoder()
-    let sseBuffer = ''
+    let stderrText = ''
+    stderr?.on('data', (chunk: Buffer) => {
+      stderrText += chunk.toString('utf8')
+      if (stderrText.length > 4_000) stderrText = stderrText.slice(-4_000)
+    })
 
-    try {
-      // Use a terminal-completion timeout to avoid hanging forever if the
-      // server never sends a terminal event.
-      const terminalTimer = setTimeout(() => {
-        eventController.abort()
-      }, TERMINAL_COMPLETION_TIMEOUT_MS)
-
+    let exited = false
+    let exitCode: number | null = null
+    let spawnError: Error | undefined
+    const killChild = (): void => {
+      if (exited) return
       try {
-        while (true) {
-          const readPromise = eventReader.read()
-          const { value, done } = await withTimeout(
-            readPromise,
-            TERMINAL_COMPLETION_TIMEOUT_MS,
-            'terminal completion',
-            sessionId,
-            options.signal,
-          )
-          if (done) break
+        child.kill()
+      } catch {
+        // Process may already be gone.
+      }
+    }
+    if (stdin === null || stdout === null) {
+      killChild()
+      throw new LlmError('OpenCode CLI was spawned without piped stdio', 'TRANSPORT')
+    }
+    child.on('error', (error: Error) => {
+      spawnError = error
+    })
+    child.on('close', (code: number | null) => {
+      exited = true
+      exitCode = code
+    })
 
-          sseBuffer += decoder.decode(value, { stream: true })
-          const lines = sseBuffer.split('\n')
-          sseBuffer = lines.pop() ?? ''
+    // Abort forwarding: the harness cancels a turn by aborting the signal.
+    const onAbort = (): void => killChild()
+    if (options.signal !== undefined) {
+      if (options.signal.aborted) {
+        killChild()
+        throw new LlmError('OpenCode request aborted by caller', 'ABORTED')
+      }
+      options.signal.addEventListener('abort', onAbort, { once: true })
+    }
+    const watchdog = setTimeout(() => killChild(), connection.timeoutMs)
 
-          for (const line of lines) {
-            const data = parseSseLine(line)
-            if (data === null) continue
+    // Feed the conversation through stdin: no argv length ceiling, and the
+    // CLI treats EOF as "run this prompt".
+    stdin.on('error', () => {
+      // Broken pipe when the child exits early; surfaced via exit code.
+    })
+    try {
+      stdin.write(prompt)
+      stdin.end()
+    } catch {
+      // Ignore: the close handler reports the failure.
+    }
 
-            const event = parseSseEvent(data)
-            const eventType = event.type
+    let buffer = ''
+    let accumulatedText = ''
+    let blockOpened = false
+    let errorMessage: string | undefined
 
-            if (eventType === 'session.text.delta' || eventType === 'session.next.text.delta') {
-              const deltaEvent = event as WireTextDeltaEvent
-              const delta = deltaEvent.data.delta ?? deltaEvent.data.text ?? ''
-              if (delta.length === 0) continue
+    /**
+     * Parse one stdout line.
+     * @param line - raw line, possibly empty.
+     * @returns the text delta to emit, or null for non-text events.
+     */
+    const consumeLine = (line: string): string | null => {
+      const trimmed = line.trim()
+      if (trimmed.length === 0) return null
+      let event: CliEvent
+      try {
+        event = JSON.parse(trimmed) as CliEvent
+      } catch {
+        return null
+      }
+      if (event.type === 'text') {
+        const text = typeof event.part?.text === 'string' ? event.part.text : ''
+        return text.length === 0 ? null : text
+      }
+      if (event.type === 'error') {
+        const dataMessage = event.error?.data?.message
+        const name = event.error?.name
+        const message = typeof dataMessage === 'string' && dataMessage.length > 0
+          ? dataMessage
+          : typeof name === 'string' && name.length > 0
+            ? name
+            : 'OpenCode CLI error'
+        errorMessage = message
+      }
+      return null
+    }
 
-              if (!blockOpened) {
-                yield { type: 'block-start', index: 0, blockType: 'text' }
-                blockOpened = true
-              }
-              accumulatedText += delta
-              yield { type: 'text-delta', index: 0, text: delta }
-              continue
-            }
-
-            // session.next.text.ended carries the complete final text for a
-            // text block. Use it only when no deltas were received to avoid
-            // duplicating text that was already streamed.
-            if (eventType === 'session.next.text.ended') {
-              const endedEvent = event as WireTextEndedEvent
-              const finalText = endedEvent.data.text ?? ''
-              if (finalText.length > 0 && accumulatedText.length === 0) {
-                if (!blockOpened) {
-                  yield { type: 'block-start', index: 0, blockType: 'text' }
-                  blockOpened = true
-                }
-                accumulatedText += finalText
-                yield { type: 'text-delta', index: 0, text: finalText }
-              }
-              continue
-            }
-
-            // session.next.step.ended is terminal. Any text in this event
-            // (or a preceding text.ended) must be flushed before finishing.
-            if (eventType === 'session.next.step.ended') {
-              const stepEvent = event as WireStepEndedEvent
-              // If step.ended carries text we haven't seen yet, emit it.
-              const stepText = (stepEvent.data as Record<string, unknown> | undefined)?.text
-              if (typeof stepText === 'string' && stepText.length > 0 && accumulatedText.length === 0) {
-                if (!blockOpened) {
-                  yield { type: 'block-start', index: 0, blockType: 'text' }
-                  blockOpened = true
-                }
-                accumulatedText += stepText
-                yield { type: 'text-delta', index: 0, text: stepText }
-              }
-              clearTimeout(terminalTimer)
-              if (blockOpened) {
-                yield { type: 'block-end', index: 0, block: { type: 'text', text: accumulatedText } }
-              }
-              yield { type: 'finish', reason: { kind: 'stop' } }
-              return
-            }
-
-            if (
-              eventType === 'session.execution.succeeded' || eventType === 'session.idle'
-              || eventType === 'session.next.step.succeeded' || eventType === 'session.next.step.idle'
-            ) {
-              clearTimeout(terminalTimer)
-              if (blockOpened) {
-                yield { type: 'block-end', index: 0, block: { type: 'text', text: accumulatedText } }
-              }
-              yield { type: 'finish', reason: { kind: 'stop' } }
-              return
-            }
-
-            if (
-              eventType === 'session.execution.failed' || eventType === 'session.error'
-              || eventType === 'session.next.step.failed'
-            ) {
-              clearTimeout(terminalTimer)
-              void interruptSession(connection.baseURL, sessionId)
-              if (blockOpened) {
-                yield { type: 'block-end', index: 0, block: { type: 'text', text: accumulatedText } }
-              }
-              const errorData = event.data as {
-                message?: string
-                error?: string | { message?: string }
-              } | undefined
-              const errorMessage = errorData?.message
-                ?? (typeof errorData?.error === 'string' ? errorData.error : undefined)
-                ?? (typeof errorData?.error === 'object' && errorData.error !== null ? errorData.error.message : undefined)
-                ?? `OpenCode session ${eventType}`
-              yield {
-                type: 'finish',
-                reason: {
-                  kind: 'error',
-                  failure: {
-                    message: errorMessage,
-                    code: ERROR_CODE_MAP[eventType] ?? 'PROVIDER_ERROR',
-                  },
-                },
-              }
-              return
-            }
-            // Unknown events are silently skipped (merge-extensible).
+    try {
+      for await (const chunk of stdout) {
+        buffer += (chunk as Buffer).toString('utf8')
+        const lines = buffer.split('\n')
+        buffer = lines.pop() ?? ''
+        for (const line of lines) {
+          const delta = consumeLine(line)
+          if (delta === null) continue
+          if (!blockOpened) {
+            blockOpened = true
+            yield { type: 'block-start', index: 0, blockType: 'text' }
           }
+          accumulatedText += delta
+          yield { type: 'text-delta', index: 0, text: delta }
         }
-        clearTimeout(terminalTimer)
-      } catch (error: unknown) {
-        clearTimeout(terminalTimer)
-        void interruptSession(connection.baseURL, sessionId)
-        if (error instanceof LlmError) throw error
-        if (options.signal?.aborted) {
-          throw new LlmError('OpenCode request aborted by caller', 'ABORTED', { cause: error })
+      }
+      const tail = consumeLine(buffer)
+      if (tail !== null) {
+        if (!blockOpened) {
+          blockOpened = true
+          yield { type: 'block-start', index: 0, blockType: 'text' }
         }
-        throw new LlmError(
-          `OpenCode event stream from ${connection.baseURL} failed`,
-          'TRANSPORT',
-          { cause: error },
-        )
+        accumulatedText += tail
+        yield { type: 'text-delta', index: 0, text: tail }
       }
     } finally {
-      eventController.abort()
+      clearTimeout(watchdog)
+      options.signal?.removeEventListener('abort', onAbort)
+      killChild()
     }
 
-    // Stream ended without a terminal event — treat as clean stop.
+    // stdout can close a tick before the process reports its exit status;
+    // wait briefly so error paths see the real code.
+    await new Promise<void>((resolve) => {
+      if (exited) {
+        resolve()
+        return
+      }
+      const timer = setTimeout(resolve, 2_000)
+      child.once('close', () => {
+        clearTimeout(timer)
+        resolve()
+      })
+    })
+
+    if (options.signal?.aborted) {
+      throw new LlmError('OpenCode request aborted by caller', 'ABORTED')
+    }
+    if (spawnError !== undefined) {
+      throw new LlmError(
+        `OpenCode CLI could not run (${connection.cliPath}): ${spawnError.message}`,
+        'TRANSPORT',
+        { cause: spawnError },
+      )
+    }
+    if (errorMessage !== undefined) {
+      if (blockOpened) {
+        yield { type: 'block-end', index: 0, block: { type: 'text', text: accumulatedText } }
+      }
+      yield {
+        type: 'finish',
+        reason: { kind: 'error', failure: { message: errorMessage, code: 'PROVIDER_ERROR' } },
+      }
+      return
+    }
+    if (exitCode !== null && exitCode !== 0 && accumulatedText.length === 0) {
+      throw new LlmError(
+        `OpenCode CLI exited with code ${String(exitCode)}${stderrText.length > 0 ? `: ${stderrText.slice(0, 500)}` : ''}`,
+        'TRANSPORT',
+      )
+    }
+
     if (blockOpened) {
       yield { type: 'block-end', index: 0, block: { type: 'text', text: accumulatedText } }
     }
     yield { type: 'finish', reason: { kind: 'stop' } }
   }
 }
-

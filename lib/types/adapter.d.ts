@@ -1,48 +1,78 @@
 /**
- * `OpenCodeAdapter`: HTTP + SSE against a local OpenCode server, emitting
- * harness StreamChunks. The adapter creates a session, subscribes to events,
- * sends the serialized conversation as a prompt, and translates SSE events
- * into the harness streaming protocol.
+ * `OpenCodeAdapter`: drives the local `opencode` CLI in JSON-event mode and
+ * emits harness StreamChunks.
  *
- * This adapter is text-output only because OpenCode runs its own internal
- * agent/tool loop. Structured DSH tool calling is not advertised.
+ * Why the CLI instead of the HTTP server: OpenCode v1.19.x exposes two model
+ * runtimes. "native" models (the free `opencode/*-free` catalogue) are only
+ * executable by the first-party client, and the headless `opencode serve`
+ * runner rejects them with `SessionRunnerModel.UnsupportedApiError`, while the
+ * OpenCode backend rejects them with `FreeTierError` when the request does not
+ * come from a first-party client. `opencode run` is a first-party client, so
+ * spawning it is the only supported path that keeps the free catalogue usable
+ * from inside another harness.
+ *
+ * The adapter serializes the whole DSH conversation into one prompt, pipes it
+ * to the CLI over stdin (no command-line length limits), and translates the
+ * CLI's `--format json` event lines into harness StreamChunks.
+ *
+ * This adapter is text-output only: OpenCode runs its own internal agent/tool
+ * loop, so structured DSH tool calling is not advertised.
  *
  * @module dsh-llm-opencode/adapter
  */
 import { LlmAdapter } from '@deepseek-ai/dsh-llm';
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, ResolvedRetryPolicy, StreamChunk } from '@deepseek-ai/dsh-llm';
-/** Default base URL for the local OpenCode server. */
-export declare const DEFAULT_BASE_URL = "http://127.0.0.1:4096";
-/** Default context window for the OpenCode provider. */
+import type { ChildProcess } from 'node:child_process';
+/** Default context window when a model entry does not declare one. */
 export declare const DEFAULT_CONTEXT_WINDOW = 128000;
 /** Default per-request output-token cap. */
 export declare const DEFAULT_MAX_TOKENS = 16384;
 /**
- * The providerID used in the OpenCode `ModelRef` when selecting a model.
- * This maps the DSH `opencode-local` provider route to the wire-level
- * `opencode` providerID that the OpenCode server expects.
+ * Wire provider ID inside OpenCode. The DSH route is `opencode-local`, but the
+ * model string handed to `opencode run` is `opencode/<model>`.
  */
 export declare const OPENCODE_PROVIDER_ID = "opencode";
-/** Connection options resolved once per stream call. */
+/** Default CLI executable looked up on `PATH`. */
+export declare const DEFAULT_CLI_PATH = "opencode";
+/** Default wall-clock cap for one CLI turn. */
+export declare const DEFAULT_TIMEOUT_MS = 600000;
+/** Catalogue entry surfaced to DSH model pickers. */
+export interface OpenCodeModelEntry {
+    id: string;
+    name?: string;
+    description?: string;
+    contextWindow?: number;
+    maxTokens?: number;
+}
+/**
+ * Free models that the CLI can drive today. Availability changes upstream; run
+ * `opencode models` to inspect the live catalogue.
+ */
+export declare const DEFAULT_MODELS: readonly OpenCodeModelEntry[];
+/** Connection facts resolved once per stream call. */
 export interface OpenCodeConnectionOptions {
-    baseURL: string;
+    cliPath: string;
+    timeoutMs: number;
+    models: readonly OpenCodeModelEntry[];
     retryPolicy: ResolvedRetryPolicy;
 }
 /** Constructor options for {@link OpenCodeAdapter}. */
 export interface OpenCodeAdapterOptions {
     /** Current validated connection facts; called once per operation. */
     options: () => OpenCodeConnectionOptions;
+    /**
+     * Test seam: replace the CLI process factory. Production omits it and the
+     * adapter spawns the real executable.
+     */
+    spawn?: (command: string, args: readonly string[]) => ChildProcess;
 }
 /**
  * The OpenCode LLM adapter. One instance serves every model name it was
  * registered under (the harness model name IS the wire model name).
- *
- * The adapter creates a fresh OpenCode session per stream call, serializes
- * the full DSH conversation into the prompt, and translates SSE events into
- * harness StreamChunks.
  */
 export declare class OpenCodeAdapter extends LlmAdapter {
     private readonly config;
+    private readonly spawnCli;
     constructor(config: OpenCodeAdapterOptions);
     providerInfo(provider: string): LlmProviderInfo;
     providerRetryPolicy(_provider: string): ResolvedRetryPolicy;
