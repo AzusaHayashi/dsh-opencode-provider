@@ -62,15 +62,15 @@ export interface OpenCodeModelEntry {
 }
 
 /**
- * Free models that the CLI can drive today. Availability changes upstream; run
- * `opencode models` to inspect the live catalogue.
+ * Free models verified to work through `opencode run` at the time of writing
+ * (OpenCode CLI 1.19.3). Availability is upstream-controlled; run
+ * `opencode models` and probe the live catalogue before relying on an id.
  */
 export const DEFAULT_MODELS: readonly OpenCodeModelEntry[] = [
   { id: 'mimo-v2.6-flash-free', name: 'MiMo V2.6 Flash (free)' },
   { id: 'glm-5.3-flash-free', name: 'GLM-5.3 Flash (free)' },
   { id: 'deepseek-v4.1-flash-free', name: 'DeepSeek V4.1 Flash (free)' },
-  { id: 'nemotron-3.5-lightning-free', name: 'Nemotron 3.5 Lightning (free)' },
-  { id: 'qwen3.6-plus-free', name: 'Qwen3.6 Plus (free)' },
+  { id: 'longcat-2.5-preview-free', name: 'LongCat 2.5 Preview (free)' },
 ]
 
 /** Connection facts resolved once per stream call. */

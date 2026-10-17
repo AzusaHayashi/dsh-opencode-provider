@@ -45,8 +45,9 @@ export interface OpenCodeModelEntry {
     maxTokens?: number;
 }
 /**
- * Free models that the CLI can drive today. Availability changes upstream; run
- * `opencode models` to inspect the live catalogue.
+ * Free models verified to work through `opencode run` at the time of writing
+ * (OpenCode CLI 1.19.3). Availability is upstream-controlled; run
+ * `opencode models` and probe the live catalogue before relying on an id.
  */
 export declare const DEFAULT_MODELS: readonly OpenCodeModelEntry[];
 /** Connection facts resolved once per stream call. */
