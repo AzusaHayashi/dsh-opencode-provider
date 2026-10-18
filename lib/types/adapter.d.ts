@@ -62,6 +62,12 @@ export interface OpenCodeAdapterOptions {
     /** Current validated connection facts; called once per operation. */
     options: () => OpenCodeConnectionOptions;
     /**
+     * Resolve the absolute working directory for one session identity. The DSH
+     * host process runs from the harness checkout, so the spawned CLI must be
+     * pointed at the session's project tree explicitly.
+     */
+    resolveDirectory?: (sessionId: string | undefined) => Promise<string | undefined>;
+    /**
      * Test seam: replace the CLI process factory. Production omits it and the
      * adapter spawns the real executable.
      */
@@ -74,6 +80,7 @@ export interface OpenCodeAdapterOptions {
 export declare class OpenCodeAdapter extends LlmAdapter {
     private readonly config;
     private readonly spawnCli;
+    private readonly resolveDirectory;
     constructor(config: OpenCodeAdapterOptions);
     providerInfo(provider: string): LlmProviderInfo;
     providerRetryPolicy(_provider: string): ResolvedRetryPolicy;

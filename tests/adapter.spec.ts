@@ -43,6 +43,7 @@ interface BuildOptions {
   lines?: string[]
   exitCode?: number | null
   captured?: { command: string; args: readonly string[]; stdin: string }
+  resolveDirectory?: (sessionId: string | undefined) => Promise<string | undefined>
 }
 
 /** Construct an adapter whose CLI factory is a scripted fake. */
@@ -55,6 +56,7 @@ function buildAdapter(options: BuildOptions = {}): OpenCodeAdapter {
   }
   const adapterOptions: OpenCodeAdapterOptions = {
     options: () => connection,
+    ...(options.resolveDirectory === undefined ? {} : { resolveDirectory: options.resolveDirectory }),
     spawn: (command, args) => {
       if (options.captured !== undefined) {
         options.captured.command = command
@@ -83,6 +85,18 @@ async function collect(adapter: OpenCodeAdapter): Promise<unknown[]> {
     model: 'mimo-v2.6-flash-free',
     system: 'Be terse.',
     messages: [{ role: 'user', content: [{ type: 'text', text: 'Say OK' }] }],
+  })
+  for await (const chunk of iterable) chunks.push(chunk)
+  return chunks
+}
+
+/** Drive `adapter.stream()` with a session id stamped on the request. */
+async function collectWithSession(adapter: OpenCodeAdapter, sessionId: string): Promise<unknown[]> {
+  const chunks: unknown[] = []
+  const iterable = adapter.stream({
+    model: 'mimo-v2.6-flash-free',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'Say OK' }] }],
+    sessionId: sessionId as never,
   })
   for await (const chunk of iterable) chunks.push(chunk)
   return chunks
@@ -154,5 +168,47 @@ describe('OpenCodeAdapter', () => {
     const adapter = buildAdapter({ lines: ['not json', textEvent('OK')] })
     const chunks = await collect(adapter)
     expect(chunks).toContainEqual({ type: 'text-delta', index: 0, text: 'OK' })
+  })
+
+  it('passes `--dir <session cwd>` so edits land in the session project tree', async () => {
+    const captured = { command: '', args: [] as readonly string[], stdin: '' }
+    const seen: (string | undefined)[] = []
+    const adapter = buildAdapter({
+      captured,
+      lines: [textEvent('OK')],
+      resolveDirectory: async (sessionId) => {
+        seen.push(sessionId)
+        return 'D:\\Projects\\EpubOnline'
+      },
+    })
+    await collectWithSession(adapter, 'session-1502d863-6427-481f-bf6b-806d66c75ce0')
+    expect(seen).toEqual(['session-1502d863-6427-481f-bf6b-806d66c75ce0'])
+    expect(captured.args).toEqual([
+      'run',
+      '--format',
+      'json',
+      '-m',
+      'opencode/mimo-v2.6-flash-free',
+      '--dir',
+      'D:\\Projects\\EpubOnline',
+    ])
+  })
+
+  it('omits `--dir` when the session directory cannot be resolved', async () => {
+    const captured = { command: '', args: [] as readonly string[], stdin: '' }
+    const adapter = buildAdapter({
+      captured,
+      lines: [textEvent('OK')],
+      resolveDirectory: async () => undefined,
+    })
+    await collectWithSession(adapter, 'session-missing')
+    expect(captured.args).toEqual(['run', '--format', 'json', '-m', 'opencode/mimo-v2.6-flash-free'])
+  })
+
+  it('keeps the legacy argv when no directory resolver is configured', async () => {
+    const captured = { command: '', args: [] as readonly string[], stdin: '' }
+    const adapter = buildAdapter({ captured, lines: [textEvent('OK')] })
+    await collectWithSession(adapter, 'session-1502d863-6427-481f-bf6b-806d66c75ce0')
+    expect(captured.args).toEqual(['run', '--format', 'json', '-m', 'opencode/mimo-v2.6-flash-free'])
   })
 })

@@ -86,6 +86,12 @@ export interface OpenCodeAdapterOptions {
   /** Current validated connection facts; called once per operation. */
   options: () => OpenCodeConnectionOptions
   /**
+   * Resolve the absolute working directory for one session identity. The DSH
+   * host process runs from the harness checkout, so the spawned CLI must be
+   * pointed at the session's project tree explicitly.
+   */
+  resolveDirectory?: (sessionId: string | undefined) => Promise<string | undefined>
+  /**
    * Test seam: replace the CLI process factory. Production omits it and the
    * adapter spawns the real executable.
    */
@@ -116,6 +122,9 @@ interface CliEvent {
  */
 export class OpenCodeAdapter extends LlmAdapter {
   private readonly spawnCli: (command: string, args: readonly string[]) => ChildProcess
+  private readonly resolveDirectory:
+    | ((sessionId: string | undefined) => Promise<string | undefined>)
+    | undefined
 
   constructor(private readonly config: OpenCodeAdapterOptions) {
     super()
@@ -124,6 +133,7 @@ export class OpenCodeAdapter extends LlmAdapter {
       env: process.env,
       windowsHide: true,
     }))
+    this.resolveDirectory = config.resolveDirectory
   }
 
   override providerInfo(provider: string): LlmProviderInfo {
@@ -164,9 +174,21 @@ export class OpenCodeAdapter extends LlmAdapter {
 
     // Spawn the first-party CLI. `--format json` emits one JSON object per
     // line on stdout; stderr is diagnostic only.
+    //
+    // `--dir` pins the CLI to the session's project directory. Without it the
+    // CLI inherits the DSH host process cwd (the harness checkout) and every
+    // file edit lands outside the user's project.
+    const directory = this.resolveDirectory === undefined
+      ? undefined
+      : await this.resolveDirectory(options.sessionId === undefined
+        ? undefined
+        : String(options.sessionId))
+    const args = ['run', '--format', 'json', '-m', modelArg]
+    if (directory !== undefined) args.push('--dir', directory)
+
     let child: ChildProcess
     try {
-      child = this.spawnCli(connection.cliPath, ['run', '--format', 'json', '-m', modelArg])
+      child = this.spawnCli(connection.cliPath, args)
     } catch (error) {
       throw new LlmError(
         `OpenCode CLI launch failed (${connection.cliPath}): ${String(error)}`,

@@ -36,7 +36,7 @@ export type {
 } from './adapter.ts'
 
 export const name = 'llm-opencode'
-export const inject = ['llm']
+export const inject = ['llm', 'sessionQuery']
 
 /** The single provider route this plugin owns. */
 const PROVIDER = 'opencode-local'
@@ -127,6 +127,39 @@ export function apply(ctx: Context, config: Config | undefined): void {
   }
   options()
 
-  const adapter = new OpenCodeAdapter({ options })
+  const adapter = new OpenCodeAdapter({
+    options,
+    resolveDirectory: async (sessionId) => resolveSessionDirectory(ctx, sessionId),
+  })
   ctx.llm.registerAdapter([PROVIDER], adapter)
+}
+
+/**
+ * Resolve the absolute working directory recorded for one session.
+ *
+ * The adapter runs inside the DSH host process, whose `process.cwd()` is the
+ * harness checkout (`D:\Projects\deepseek-harness`) rather than the session's
+ * project directory. `opencode run` defaults to the process cwd, so without
+ * this lookup every spawned CLI edits the wrong tree.
+ *
+ * @param ctx - plugin context carrying the session query service.
+ * @param sessionId - session identity stamped on the request by the agent loop.
+ * @returns the recorded session cwd, or undefined when it cannot be resolved.
+ */
+async function resolveSessionDirectory(
+  ctx: Context,
+  sessionId: string | undefined,
+): Promise<string | undefined> {
+  if (sessionId === undefined) return undefined
+  const query = ctx.get('sessionQuery')
+  if (query === undefined) return undefined
+  try {
+    const observation = await query.observeSession(sessionId as never, { projectionMode: 'none' })
+    const cwd = observation.header.cwd
+    return typeof cwd === 'string' && cwd.length > 0 ? cwd : undefined
+  } catch {
+    // A missing or unreadable session must not fail the turn: the caller falls
+    // back to the process cwd, which is still a usable working directory.
+    return undefined
+  }
 }
